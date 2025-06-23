@@ -1,8 +1,17 @@
 # Ebook to Audio Converter
 
+> **Looking to install? See [INSTALLATION.md](./INSTALLATION.md) for step-by-step setup instructions.**
+
+
+
 ## Aim of the Project
 
 The Ebook to Audio Converter is a Python application designed to transform scanned book pages into audible content. By leveraging Optical Character Recognition (OCR) to extract text from images and Text-to-Speech (TTS) technologies to convert that text into audio, this project aims to enhance accessibility to literature. It is particularly beneficial for individuals who prefer audio formats, such as those with visual impairments or those who enjoy audiobooks during commutes or multitasking.
+
+
+## Installation
+
+For detailed installation instructions, please see [INSTALLATION.md](./INSTALLATION.md).
 
 ## Main Components
 
@@ -85,8 +94,3 @@ This balance of flexibility, usability, and performance makes the application bo
 - **Abbreviated Chapters**: Add functionality to generate concise summaries or abbreviated versions of chapters, ideal for quick listens or previews.
 - **Expanded TTS Options**: Incorporate additional voices and languages for greater personalization and accessibility.
 - **Cloud Storage Integration**: Enable saving and retrieving files from cloud services like Google Drive or Dropbox for seamless access across devices.
-
-## Security Note
-
-**Do not hardcode your xAI API key in the code.**  
-Instead, create a `.env` file in the project root with the following content:
