@@ -2,8 +2,26 @@ import sys
 import os
 from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtCore import QUrl, Qt
+from PySide6.QtCore import QUrl, Qt, QThread, Signal
 from jpeg_to_audio import Book, EasyOCROCR, TesseractOCR, GTTSStrategy, ParlerTTSStrategy, KokoroTTSStrategy, XAITextPostProcessStrategy, FileSystemRepo
+
+class ProcessingThread(QThread):
+    """Background thread for processing jobs"""
+    finished = Signal()
+    error = Signal(str)
+    
+    def __init__(self, processing_function, *args, **kwargs):
+        super().__init__()
+        self.processing_function = processing_function
+        self.args = args
+        self.kwargs = kwargs
+    
+    def run(self):
+        try:
+            self.processing_function(*self.args, **self.kwargs)
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -13,6 +31,9 @@ class MainWindow(QMainWindow):
 
         # Status bar for messages
         self.statusBar().showMessage("Ready")
+        
+        # Processing thread
+        self.processing_thread = None
 
         main_layout = QHBoxLayout()
 
@@ -202,75 +223,118 @@ class MainWindow(QMainWindow):
             self.play_button.setVisible(True)
             self.stop_button.setVisible(True)
 
+    def set_processing_state(self, processing=True):
+        """Enable/disable UI elements during processing"""
+        self.select_folder_button.setEnabled(not processing)
+        self.execute_button.setEnabled(not processing)
+        self.export_button.setEnabled(not processing)
+        
+        if processing:
+            self.statusBar().showMessage("Processing... Please wait.")
+        else:
+            self.statusBar().showMessage("Ready")
+
     def execute(self):
         if not hasattr(self, 'selected_folder'):
             self.folder_label.setText("Please select a folder first.")
             self.statusBar().showMessage("Please select a folder first.")
             return
-        self.statusBar().showMessage("Processing... Please wait.")
-        ocr_strategy_class = self.ocr_strategy_combobox.currentData()
-        tts_strategy_class = self.tts_strategy_combobox.currentData()
-        post_process_strategy_class = self.post_process_strategy_combobox.currentData()
+        
+        # Disable UI elements
+        self.set_processing_state(True)
+        
+        # Create processing function
+        def process_job():
+            ocr_strategy_class = self.ocr_strategy_combobox.currentData()
+            tts_strategy_class = self.tts_strategy_combobox.currentData()
+            post_process_strategy_class = self.post_process_strategy_combobox.currentData()
 
-        ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
-        tts_strategy = tts_strategy_class()
+            ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
+            tts_strategy = tts_strategy_class()
 
-        # If KokoroTTS is selected, set the voice
-        if isinstance(tts_strategy, KokoroTTSStrategy) and not self.voice_combobox.isHidden():
-            selected_voice = self.voice_combobox.currentText()
-            tts_strategy.voice_name = selected_voice  # Assuming there's a setter for voice
+            # If KokoroTTS is selected, set the voice
+            if isinstance(tts_strategy, KokoroTTSStrategy) and not self.voice_combobox.isHidden():
+                selected_voice = self.voice_combobox.currentText()
+                tts_strategy.voice_name = selected_voice
 
-        book = Book(self.selected_folder, ocr_strategy, tts_strategy)
+            book = Book(self.selected_folder, ocr_strategy, tts_strategy)
+            selected_chapter = self.chapter_combobox.currentText()
 
-        selected_chapter = self.chapter_combobox.currentText()
+            if self.extract_text_radio.isChecked():
+                if selected_chapter == "All Chapters":
+                    book.extract_all_texts(overwrite=True)
+                    book.save_all_texts()
+                else:
+                    book.extract_text(selected_chapter, overwrite=True)
+                    book.save_chapter_text(selected_chapter)
 
-        if self.extract_text_radio.isChecked():
-            if selected_chapter == "All Chapters":
-                book.extract_all_texts(overwrite=True)
-                book.save_all_texts()
-            else:
-                book.extract_text(selected_chapter, overwrite=True)
-                book.save_chapter_text(selected_chapter)
+            if self.rerun_post_process_radio.isChecked():
+                if selected_chapter == "All Chapters":
+                    book.rerun_post_processing()
+                else:
+                    book.rerun_post_processing(selected_chapter)
 
-        if self.rerun_post_process_radio.isChecked():
-            if selected_chapter == "All Chapters":
-                book.rerun_post_processing()
-            else:
-                book.rerun_post_processing(selected_chapter)
+            if self.generate_audio_checkbox.isChecked():
+                if selected_chapter == "All Chapters":
+                    book.convert_all_texts_to_audio(overwrite=True)
+                else:
+                    book.convert_text_to_audio(selected_chapter, overwrite=True)
 
-        if self.generate_audio_checkbox.isChecked():
-            if selected_chapter == "All Chapters":
-                book.convert_all_texts_to_audio(overwrite=True)
-            else:
-                book.convert_text_to_audio(selected_chapter, overwrite=True)
+        # Start processing in background thread
+        self.processing_thread = ProcessingThread(process_job)
+        self.processing_thread.finished.connect(self.on_processing_finished)
+        self.processing_thread.error.connect(self.on_processing_error)
+        self.processing_thread.start()
 
+    def on_processing_finished(self):
+        """Called when processing is complete"""
         self.load_files()
+        self.set_processing_state(False)
         self.statusBar().showMessage("Processing complete.")
+
+    def on_processing_error(self, error_message):
+        """Called when processing encounters an error"""
+        self.set_processing_state(False)
+        self.statusBar().showMessage(f"Error: {error_message}")
 
     def export(self):
         if not hasattr(self, 'selected_folder'):
             self.folder_label.setText("Please select a folder first.")
             self.statusBar().showMessage("Please select a folder first.")
             return
-        self.statusBar().showMessage("Exporting...")
-        ocr_strategy_class = self.ocr_strategy_combobox.currentData()
-        tts_strategy_class = self.tts_strategy_combobox.currentData()
-        post_process_strategy_class = self.post_process_strategy_combobox.currentData()
+        
+        # Disable UI elements
+        self.set_processing_state(True)
+        
+        # Create export function
+        def export_job():
+            ocr_strategy_class = self.ocr_strategy_combobox.currentData()
+            tts_strategy_class = self.tts_strategy_combobox.currentData()
+            post_process_strategy_class = self.post_process_strategy_combobox.currentData()
 
-        ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
-        tts_strategy = tts_strategy_class()
+            ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
+            tts_strategy = tts_strategy_class()
 
-        book = Book(self.selected_folder, ocr_strategy, tts_strategy)
-        repo = FileSystemRepo(os.path.join(os.path.dirname(os.path.dirname(self.selected_folder)), 'book_chapters'))
+            book = Book(self.selected_folder, ocr_strategy, tts_strategy)
+            repo = FileSystemRepo(os.path.join(os.path.dirname(os.path.dirname(self.selected_folder)), 'book_chapters'))
 
-        selected_chapter = self.chapter_combobox.currentText()
+            selected_chapter = self.chapter_combobox.currentText()
 
-        if selected_chapter == "All Chapters":
-            book.export_all_chapters(repo)
-        else:
-            book.export_chapter(selected_chapter, repo)
+            if selected_chapter == "All Chapters":
+                book.export_all_chapters(repo)
+            else:
+                book.export_chapter(selected_chapter, repo)
 
+        # Start export in background thread
+        self.processing_thread = ProcessingThread(export_job)
+        self.processing_thread.finished.connect(self.on_export_finished)
+        self.processing_thread.error.connect(self.on_processing_error)
+        self.processing_thread.start()
+
+    def on_export_finished(self):
+        """Called when export is complete"""
         self.load_files()
+        self.set_processing_state(False)
         self.statusBar().showMessage("Export complete.")
 
 if __name__ == '__main__':
