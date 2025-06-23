@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.mp3
+*.wav
+*.log
+Kokoro-82M/
+book_chapters/
+book_pages/
+.idea/
+.vscode/
+.DS_Store

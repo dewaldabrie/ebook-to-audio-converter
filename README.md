@@ -85,3 +85,8 @@ This balance of flexibility, usability, and performance makes the application bo
 - **Abbreviated Chapters**: Add functionality to generate concise summaries or abbreviated versions of chapters, ideal for quick listens or previews.
 - **Expanded TTS Options**: Incorporate additional voices and languages for greater personalization and accessibility.
 - **Cloud Storage Integration**: Enable saving and retrieving files from cloud services like Google Drive or Dropbox for seamless access across devices.
+
+## Security Note
+
+**Do not hardcode your xAI API key in the code.**  
+Instead, create a `.env` file in the project root with the following content:

@@ -11,6 +11,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Ebook to Audio Converter")
 
+        # Status bar for messages
+        self.statusBar().showMessage("Ready")
+
         main_layout = QHBoxLayout()
 
         left_layout = QVBoxLayout()
@@ -19,6 +22,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.folder_label)
 
         self.select_folder_button = QPushButton("Select Folder")
+        self.select_folder_button.setToolTip("Choose the root folder containing book pages (JPEG/JPG).")
         self.select_folder_button.clicked.connect(self.select_folder)
         left_layout.addWidget(self.select_folder_button)
 
@@ -34,26 +38,34 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.rerun_post_process_radio)
         left_layout.addWidget(self.skip_text_extraction)
         self.extract_text_radio.setChecked(True)  # Default selection
+        self.extract_text_radio.setToolTip("Extract text from images using the selected OCR strategy.")
+        self.rerun_post_process_radio.setToolTip("Rerun post-processing on existing text files.")
+        self.skip_text_extraction.setToolTip("Skip text extraction step.")
 
         self.generate_audio_checkbox = QCheckBox("Generate Audio")
         left_layout.addWidget(self.generate_audio_checkbox)
+        self.generate_audio_checkbox.setToolTip("Generate audio from extracted text using the selected TTS strategy.")
 
         self.ocr_strategy_label = QLabel("Select OCR Strategy:")
         left_layout.addWidget(self.ocr_strategy_label)
+        self.ocr_strategy_label.setToolTip("Choose the OCR engine for text extraction.")
 
         self.ocr_strategy_combobox = QComboBox()
         self.ocr_strategy_combobox.addItem("EasyOCR", EasyOCROCR)
         self.ocr_strategy_combobox.addItem("TesseractOCR", TesseractOCR)
         left_layout.addWidget(self.ocr_strategy_combobox)
+        self.ocr_strategy_combobox.setToolTip("OCR engine selection.")
 
         self.tts_strategy_label = QLabel("Select TTS Strategy:")
         left_layout.addWidget(self.tts_strategy_label)
+        self.tts_strategy_label.setToolTip("Choose the TTS engine for audio generation.")
 
         self.tts_strategy_combobox = QComboBox()
         self.tts_strategy_combobox.addItem("KokoroTTS", KokoroTTSStrategy)
         self.tts_strategy_combobox.addItem("GTTS", GTTSStrategy)
         self.tts_strategy_combobox.addItem("ParlerTTS", ParlerTTSStrategy)
         left_layout.addWidget(self.tts_strategy_combobox)
+        self.tts_strategy_combobox.setToolTip("TTS engine selection.")
 
          # Dynamic Voice Selection Combobox
         self.voice_combobox = QComboBox()
@@ -62,28 +74,35 @@ class MainWindow(QMainWindow):
         self.update_voice_selection(0)
         # Connect the signal for index change
         self.tts_strategy_combobox.currentIndexChanged.connect(self.update_voice_selection)
+        self.voice_combobox.setToolTip("Select a voice for Kokoro TTS.")
 
 
         self.post_process_strategy_label = QLabel("Select Post-Process Strategy:")
         left_layout.addWidget(self.post_process_strategy_label)
+        self.post_process_strategy_label.setToolTip("Choose the post-processing strategy for OCR text.")
 
         self.post_process_strategy_combobox = QComboBox()
         self.post_process_strategy_combobox.addItem("XAITextPostProcess", XAITextPostProcessStrategy)
         left_layout.addWidget(self.post_process_strategy_combobox)
+        self.post_process_strategy_combobox.setToolTip("Post-processing strategy selection.")
 
         self.chapter_label = QLabel("Select Chapter:")
         left_layout.addWidget(self.chapter_label)
+        self.chapter_label.setToolTip("Select a chapter to process or export.")
 
         self.chapter_combobox = QComboBox()
         self.chapter_combobox.addItem("All Chapters")
         left_layout.addWidget(self.chapter_combobox)
+        self.chapter_combobox.setToolTip("Chapter selection.")
 
         self.execute_button = QPushButton("Execute")
         self.execute_button.clicked.connect(self.execute)
+        self.execute_button.setToolTip("Run the selected actions (text extraction, post-processing, audio generation).")
         left_layout.addWidget(self.execute_button)
 
         self.export_button = QPushButton("Export")
         self.export_button.clicked.connect(self.export)
+        self.export_button.setToolTip("Export processed chapters to the repository.")
         left_layout.addWidget(self.export_button)
 
         main_layout.addLayout(left_layout)
@@ -142,6 +161,9 @@ class MainWindow(QMainWindow):
             self.selected_folder = folder
             self.load_files()
             self.load_chapters()
+            self.statusBar().showMessage("Folder loaded.")
+        else:
+            self.statusBar().showMessage("No folder selected.")
 
     def load_files(self):
         self.file_list.clear()
@@ -183,8 +205,9 @@ class MainWindow(QMainWindow):
     def execute(self):
         if not hasattr(self, 'selected_folder'):
             self.folder_label.setText("Please select a folder first.")
+            self.statusBar().showMessage("Please select a folder first.")
             return
-
+        self.statusBar().showMessage("Processing... Please wait.")
         ocr_strategy_class = self.ocr_strategy_combobox.currentData()
         tts_strategy_class = self.tts_strategy_combobox.currentData()
         post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -222,12 +245,14 @@ class MainWindow(QMainWindow):
                 book.convert_text_to_audio(selected_chapter, overwrite=True)
 
         self.load_files()
+        self.statusBar().showMessage("Processing complete.")
 
     def export(self):
         if not hasattr(self, 'selected_folder'):
             self.folder_label.setText("Please select a folder first.")
+            self.statusBar().showMessage("Please select a folder first.")
             return
-
+        self.statusBar().showMessage("Exporting...")
         ocr_strategy_class = self.ocr_strategy_combobox.currentData()
         tts_strategy_class = self.tts_strategy_combobox.currentData()
         post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -246,6 +271,7 @@ class MainWindow(QMainWindow):
             book.export_chapter(selected_chapter, repo)
 
         self.load_files()
+        self.statusBar().showMessage("Export complete.")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

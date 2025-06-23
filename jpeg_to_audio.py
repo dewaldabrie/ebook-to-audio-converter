@@ -5,6 +5,10 @@ import certifi
 from pprint import pformat
 from typing import Dict, List
 
+# Load environment variables from .env
+from dotenv import load_dotenv
+load_dotenv()
+
 os.environ['SSL_CERT_FILE'] = certifi.where()
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -45,13 +49,21 @@ class PostProcessStrategy:
 
 class XAITextPostProcessStrategy(PostProcessStrategy):
     def post_process_text(self, text, meta=None):
+        """
+        Post-process OCR text using the xAI API.
+        The API key is loaded from the environment variable XAI_API_KEY.
+        """
         if not text:
             return text
         logging.info("Post-processing text")
         url = "https://api.x.ai/v1/chat/completions"
+        api_key = os.getenv("XAI_API_KEY")
+        if not api_key:
+            logging.error("XAI_API_KEY not set in environment variables.")
+            return text
         headers = {
             "Content-Type": "application/json",
-            "Authorization": "Bearer xai-YOUR-API-KEY"
+            "Authorization": f"Bearer {api_key}"
         }
         payload = {
             "messages": [
@@ -319,15 +331,13 @@ class KokoroTTSStrategy(TTSStrategy):
                         batch_params
                         ))
                 if not audio_chunks:
-                    import pdb; pdb.set_trace()
+                    logging.error("No audio chunks were generated.")
                 self.combine_audio_chunks(audio_chunks, output_path)
                 for file in audio_chunks:
                     os.remove(file)
             except Exception as e:
-                import pdb; pdb.set_trace()
                 logging.error(f"Failed to convert text to audio: {e}")
         else:
-            import pdb; pdb.set_trace()
             logging.info("No text to convert to audio.")
 
     @classmethod
@@ -476,6 +486,9 @@ class Chapter:
             logging.info(f"No text found for chapter {self.title}. Skipping save.")
 
     def convert_text_to_audio(self, overwrite=False):
+        """
+        Convert the chapter's text to audio using the selected TTS strategy.
+        """
         audio_output_path = os.path.join(self.folder_path, f"{self.title}")
         if not overwrite and (os.path.exists(audio_output_path + '.wav') or os.path.exists(audio_output_path + '.mp3')):
             logging.info(f"Audio for chapter {self.title} already exists at {audio_output_path}.(wav/mp3). Skipping audio conversion.")
