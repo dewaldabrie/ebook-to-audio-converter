@@ -1,0 +1,29 @@
+ebooklib
+elevenlabs
+nltk
+bs4
+gtts
+pymovie
+playsound
+pytesseract
+pillow
+opencv-python
+easyocr
+numpy==1.26.4
+certifi
+git+https://github.com/huggingface/parler-tts.git
+pyside6
+
+# kokoro
+phonemizer 
+torch 
+transformers 
+scipy 
+munch 
+soundfile
+
+# mp3 conversion
+pydub
+
+# splitting senteneces
+nltk
