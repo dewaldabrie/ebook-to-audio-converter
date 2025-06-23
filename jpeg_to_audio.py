@@ -27,12 +27,31 @@ from transformers import AutoTokenizer
 import soundfile as sf
 
 # Kokoro
-import torch
 import sys
-sys.path.append('Kokoro-82M')
-from models import build_model
-import soundfile as sf
-from kokoro import generate
+import subprocess
+
+def ensure_kokoro_installed():
+    """
+    Ensure the Kokoro TTS model is present in the project.
+    If not, clone it from the official repository.
+    """
+    kokoro_dir = 'Kokoro-82M'
+    if not os.path.isdir(kokoro_dir):
+        print(f"[INFO] '{kokoro_dir}' not found. Cloning Kokoro repository...")
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "https://github.com/kokoro-tts/kokoro.git",
+                    kokoro_dir
+                ],
+                check=True
+            )
+            print(f"[INFO] Kokoro repository cloned successfully into '{kokoro_dir}'.")
+        except Exception as e:
+            print(f"[ERROR] Failed to clone Kokoro repository: {e}")
+            raise
 
 # Check NumPy version
 if int(np.__version__.split('.')[0]) >= 2:
@@ -293,26 +312,38 @@ class ParlerTTSStrategy(TTSStrategy):
         return chunk_path
 
 class KokoroTTSStrategy(TTSStrategy):
-    
     voices = [
-            'af', # Default voice is a 50-50 mix of Bella & Sarah
-            'af_bella', 'af_sarah', 'am_adam', 'am_michael',
-            'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis',
-            'af_nicole', 'af_sky',
-        ]
+        'af', # Default voice is a 50-50 mix of Bella & Sarah
+        'af_bella', 'af_sarah', 'am_adam', 'am_michael',
+        'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis',
+        'af_nicole', 'af_sky',
+    ]
     voice_name = 'af'
 
     def __init__(self):
+        # Only import and ensure Kokoro when this strategy is used
+        ensure_kokoro_installed()
+        import sys
+        sys.path.append('Kokoro-82M')
+        global build_model, generate
+        from models import build_model
+        from kokoro import generate
+
         self.model = None
         self.device = "cpu"
         self.voicepack = None
-    
+
     @staticmethod
     def init_worker(device, voice_name):
+        import sys
+        sys.path.append('Kokoro-82M')
+        from models import build_model
+        import torch
         global tts_model
         tts_model = build_model("Kokoro-82M/kokoro-v0_19.pth", device)
         global tts_voicepack
         tts_voicepack = torch.load(f"Kokoro-82M/voices/{voice_name}.pt", weights_only=True).to(device)
+        import logging
         logging.info(f"Loaded Kokoro voice: {voice_name}")
 
     def convert_text_to_audio(self, text, output_path):
