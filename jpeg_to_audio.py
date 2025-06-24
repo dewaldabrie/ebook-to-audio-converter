@@ -152,13 +152,16 @@ class XAITextPostProcessStrategy(PostProcessStrategy):
             return text
             
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
             if response.status_code == 200:
                 corrected = response.json().get('choices', [{}])[0].get('message', {}).get('content', text)
                 return corrected
             else:
                 logging.error(f"Failed to post-process text: {response.status_code} {response.text}")
                 return text
+        except requests.exceptions.Timeout:
+            logging.error("xAI API request timed out. Try increasing the timeout or check your network/API status.")
+            return text
         except requests.exceptions.RequestException as e:
             if _cancellation_flag.is_set():
                 return text
