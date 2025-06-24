@@ -18,13 +18,10 @@ from PIL import Image, ImageEnhance, ImageOps
 import logging
 import cv2
 import numpy as np
-import easyocr
 from gtts import gTTS
 import requests
-import torch
-from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer
 import soundfile as sf
+import time
 
 # Kokoro
 import sys
@@ -66,7 +63,7 @@ if int(np.__version__.split('.')[0]) >= 2:
 from typing import Dict
 
 logging.basicConfig(level=logging.DEBUG)
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, get_context
 
 # Add this function to handle graceful shutdown
 def signal_handler(signum, frame):
@@ -183,6 +180,8 @@ class OCRStrategy:
 
 class TesseractOCR(OCRStrategy):
     def preprocess_image(self, image_path):
+        from PIL import Image, ImageEnhance, ImageOps  # Local import
+        import cv2
         image = Image.open(image_path)
         image = ImageOps.exif_transpose(image)
         # Convert to grayscale
@@ -196,26 +195,30 @@ class TesseractOCR(OCRStrategy):
         gry = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         opn = cv2.morphologyEx(gry, cv2.MORPH_OPEN, None)
         # Save the processed image
-        Image.fromarray(opn).save(image_path)
+        from PIL import Image as PILImage
+        PILImage.fromarray(opn).save(image_path)
         return
 
     def extract_text(self, image_path):
+        from PIL import Image  # Local import
+        import pytesseract
         image = Image.open(image_path)
         return pytesseract.image_to_string(image, lang='eng')
 
 class EasyOCROCR(OCRStrategy):
     def __init__(self, post_process_strategy: PostProcessStrategy = XAITextPostProcessStrategy()):
         super().__init__(post_process_strategy)
-        self.reader = None
+        self.reader = None  # Lazy initialization
 
     def preprocess_image(self, image_path):
+        from PIL import Image, ImageOps  # Local import
         image = Image.open(image_path)
         image = ImageOps.exif_transpose(image)
         image.save(image_path)
 
     def extract_text(self, image_path):
-        # Lazy load the reader
-        if not self.reader: 
+        if self.reader is None:
+            import easyocr  # Lazy import
             self.reader = easyocr.Reader(['en'], gpu=False)
         result = self.reader.readtext(image_path, detail=0)
         return ' '.join(result)
@@ -266,7 +269,6 @@ class TTSStrategy:
                 all_audio_data.append(np.frombuffer(frames, dtype=np.int16))
                 total_frames += wf.getnframes()
 
-
         # Write the concatenated file
         params[3] = total_frames  # Update nframes
         logging.debug(f"Writing params: {params}")
@@ -283,8 +285,13 @@ class TTSStrategy:
         sound = pydub.AudioSegment.from_wav(output_path)
         mp3_output_path = output_path.replace('.wav', '.mp3')
         sound.export(mp3_output_path, format="mp3")
-        logging.debug(f"Converted audio written to {mp3_output_path}")
-        os.remove(output_path)
+        # Explicitly delete the AudioSegment object and wait before removing the file
+        del sound
+        time.sleep(0.2)  # Give the OS time to release the file handle
+        try:
+            os.remove(output_path)
+        except Exception as e:
+            logging.warning(f"Could not delete wav file {output_path}: {e}")
         return mp3_output_path
         
 
@@ -311,7 +318,9 @@ class ParlerTTSStrategy(TTSStrategy):
         self.model = None
 
     def init_worker(self, device):
-        
+        import torch
+        from parler_tts import ParlerTTSForConditionalGeneration
+        from transformers import AutoTokenizer
         global tts_model
         tts_model = ParlerTTSForConditionalGeneration.from_pretrained("parler-tts/parler-tts-mini-v1").to(device)
         global tts_tokenizer
@@ -321,17 +330,21 @@ class ParlerTTSStrategy(TTSStrategy):
         tts_input_ids = tts_tokenizer(description, return_tensors="pt").input_ids.to(device)
         
     def convert_text_to_audio(self, text, output_path):
+        import torch
+        from multiprocessing import get_context, cpu_count
         chunks = self.split_text_into_chunks(text)
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        with Pool(
+        with get_context("spawn").Pool(
             cpu_count(),
             initializer=self.init_worker,
             initargs=(device,)
-            ) as pool:
+        ) as pool:
             audio_chunks = list(pool.imap(self._process_chunk, [(device, chunk, output_path, i, len(chunks)) for i, chunk in enumerate(chunks)]))
         self.combine_audio_chunks(audio_chunks, output_path)
 
     def _process_chunk(self, args):
+        import torch
+        import soundfile as sf
         device, chunk, output_path, i, total_chunks = args
         chunk_path = f"{output_path}_chunk_{i}.wav"
         with open(f"{output_path}_chunk_{i}.txt", 'w') as f:
@@ -359,12 +372,9 @@ class KokoroTTSStrategy(TTSStrategy):
 
     def __init__(self):
         ensure_kokoro_installed()
-        import sys
-        sys.path.append('Kokoro-82M')
-        # Do NOT import build_model or generate here for multiprocessing!
-        self.model = None
         self.device = "cpu"
-        self.voicepack = None
+        self.voice_name = 'af'
+        # Do NOT load model or voicepack here!
 
     @staticmethod
     def init_worker(device, voice_name):
@@ -383,20 +393,21 @@ class KokoroTTSStrategy(TTSStrategy):
         logging.info(f"Loaded Kokoro voice: {voice_name}")
 
     def convert_text_to_audio(self, text, output_path):
+        from multiprocessing import get_context, cpu_count
         chunks = self.split_text_into_chunks(text)
         batch_params = [(chunk, output_path, i, len(chunks)) for i, chunk in enumerate(chunks) if chunk]
 
         if batch_params:
             try:
-                with Pool(
+                with get_context("spawn").Pool(
                     processes=cpu_count(), 
                     initializer=KokoroTTSStrategy.init_worker,
                     initargs=(self.device, self.voice_name)
-                    ) as pool:
+                ) as pool:
                     audio_chunks = list(pool.imap(
                         KokoroTTSStrategy._process_chunk, 
                         batch_params
-                        ))
+                    ))
                 if not audio_chunks:
                     logging.error("No audio chunks were generated.")
                 self.combine_audio_chunks(audio_chunks, output_path)
@@ -409,6 +420,7 @@ class KokoroTTSStrategy(TTSStrategy):
 
     @classmethod
     def _process_chunk(cls, params):
+        import soundfile as sf
         chunk, output_path, i, total_chunks = params
         chunk_path = f"{output_path}_chunk_{i}.wav"
         with open(f"{output_path}_chunk_{i}.txt", 'w') as f:
@@ -421,7 +433,6 @@ class KokoroTTSStrategy(TTSStrategy):
         global kokoro_generate
         if not tts_model:
             raise ValueError("Model not initialized")
-        # Use kokoro_generate instead of generate
         snippet, _ = kokoro_generate(tts_model, chunk.strip(), tts_voicepack, lang=cls.voice_name[0])
         audio.extend(snippet)
         sf.write(chunk_path, audio, 24000)
@@ -476,7 +487,7 @@ class Chapter:
         text_path = os.path.join(self.folder_path, f"{self.title}.txt")
         if not overwrite and os.path.exists(text_path):
             return
-        with Pool(cpu_count()) as pool:
+        with get_context("spawn").Pool(cpu_count()) as pool:
             results = pool.starmap(self._process_page, [(page, overwrite) for page in self.pages.keys()])
         for page, text in results:
             self.pages[page] = text
@@ -504,20 +515,16 @@ class Chapter:
     def post_process_from_pages(self, meta=None):
         chunked_pages = [list(self.pages.keys())[i:i+5] for i in range(0, len(self.pages), 5)]
         
-        # Check for cancellation before starting pool
         if _cancellation_flag.is_set():
             return
             
         try:
-            with Pool(cpu_count()) as pool:
-                # Check for cancellation periodically
+            with get_context("spawn").Pool(cpu_count()) as pool:
                 for i, result in enumerate(pool.imap_unordered(self._post_process_chunk, [(pages, meta) for pages in chunked_pages])):
                     if _cancellation_flag.is_set():
                         pool.terminate()
                         pool.join()
                         return
-                    # Process result as needed
-                    
         except Exception as e:
             if _cancellation_flag.is_set():
                 return
@@ -536,7 +543,7 @@ class Chapter:
         with open(os.path.join(self.folder_path, f"{self.title}.txt"), 'r') as f:
             lines = f.readlines()
         chunked_lines = [lines[i:i+50] for i in range(0, len(lines), 50)]
-        with Pool(cpu_count()) as pool:
+        with get_context("spawn").Pool(cpu_count()) as pool:
             processed_content = list(pool.imap(self._post_process_chunk, [(chunk, meta) for chunk in chunked_lines]))
         self.save_to_text_file('\n'.join(processed_content))
 
