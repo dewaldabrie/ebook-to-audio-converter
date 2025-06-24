@@ -355,14 +355,10 @@ class KokoroTTSStrategy(TTSStrategy):
     voice_name = 'af'
 
     def __init__(self):
-        # Only import and ensure Kokoro when this strategy is used
         ensure_kokoro_installed()
         import sys
         sys.path.append('Kokoro-82M')
-        global build_model, generate
-        from models import build_model
-        from kokoro import generate
-
+        # Do NOT import build_model or generate here for multiprocessing!
         self.model = None
         self.device = "cpu"
         self.voicepack = None
@@ -372,11 +368,14 @@ class KokoroTTSStrategy(TTSStrategy):
         import sys
         sys.path.append('Kokoro-82M')
         from models import build_model
+        from kokoro import generate
         import torch
         global tts_model
         tts_model = build_model("Kokoro-82M/kokoro-v0_19.pth", device)
         global tts_voicepack
         tts_voicepack = torch.load(f"Kokoro-82M/voices/{voice_name}.pt", weights_only=True).to(device)
+        global kokoro_generate
+        kokoro_generate = generate  # Make generate available as a global
         import logging
         logging.info(f"Loaded Kokoro voice: {voice_name}")
 
@@ -416,9 +415,11 @@ class KokoroTTSStrategy(TTSStrategy):
         audio = []
         global tts_model
         global tts_voicepack
+        global kokoro_generate
         if not tts_model:
             raise ValueError("Model not initialized")
-        snippet, _ = generate(tts_model, chunk.strip(), tts_voicepack, lang=cls.voice_name[0])
+        # Use kokoro_generate instead of generate
+        snippet, _ = kokoro_generate(tts_model, chunk.strip(), tts_voicepack, lang=cls.voice_name[0])
         audio.extend(snippet)
         sf.write(chunk_path, audio, 24000)
         return chunk_path
