@@ -1,27 +1,85 @@
 import sys
 import os
+import threading
+import signal
+import psutil
 from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtCore import QUrl, Qt, QThread, Signal
 from jpeg_to_audio import Book, EasyOCROCR, TesseractOCR, GTTSStrategy, ParlerTTSStrategy, KokoroTTSStrategy, XAITextPostProcessStrategy, FileSystemRepo
 
+# Global cancellation flag
+_cancellation_flag = threading.Event()
+
 class ProcessingThread(QThread):
     """Background thread for processing jobs"""
     finished = Signal()
     error = Signal(str)
+    cancelled = Signal()
     
     def __init__(self, processing_function, *args, **kwargs):
         super().__init__()
         self.processing_function = processing_function
         self.args = args
         self.kwargs = kwargs
+        self._cancelled = False
+        self._child_processes = []
+    
+    def cancel(self):
+        """Cancel the processing and kill child processes"""
+        global _cancellation_flag
+        _cancellation_flag.set()
+        self._cancelled = True
+        
+        # Kill all child processes
+        self._kill_child_processes()
+    
+    def _kill_child_processes(self):
+        """Kill all child processes spawned by this thread"""
+        try:
+            # Get current process
+            current_process = psutil.Process()
+            
+            # Get all child processes
+            children = current_process.children(recursive=True)
+            
+            for child in children:
+                try:
+                    # Try to terminate gracefully first
+                    child.terminate()
+                    child.wait(timeout=2)  # Wait up to 2 seconds
+                except psutil.TimeoutExpired:
+                    # Force kill if it doesn't terminate
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    # Process already dead
+                    pass
+                    
+        except Exception as e:
+            print(f"Error killing child processes: {e}")
     
     def run(self):
         try:
+            # Reset cancellation flag
+            global _cancellation_flag
+            _cancellation_flag.clear()
+            
+            # Run the processing function
             self.processing_function(*self.args, **self.kwargs)
-            self.finished.emit()
+            
+            if not _cancellation_flag.is_set():
+                self.finished.emit()
+            else:
+                self.cancelled.emit()
         except Exception as e:
-            self.error.emit(str(e))
+            if not _cancellation_flag.is_set():
+                self.error.emit(str(e))
+            else:
+                self.cancelled.emit()
+        finally:
+            # Always clean up child processes
+            if self._cancelled:
+                self._kill_child_processes()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -116,6 +174,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.chapter_combobox)
         self.chapter_combobox.setToolTip("Chapter selection.")
 
+        # Create execute/cancel button
         self.execute_button = QPushButton("Execute")
         self.execute_button.clicked.connect(self.execute)
         self.execute_button.setToolTip("Run the selected actions (text extraction, post-processing, audio generation).")
@@ -226,13 +285,32 @@ class MainWindow(QMainWindow):
     def set_processing_state(self, processing=True):
         """Enable/disable UI elements during processing"""
         self.select_folder_button.setEnabled(not processing)
-        self.execute_button.setEnabled(not processing)
         self.export_button.setEnabled(not processing)
         
         if processing:
+            # Change execute button to cancel button
+            self.execute_button.setText("Cancel")
+            self.execute_button.clicked.disconnect()
+            self.execute_button.clicked.connect(self.cancel_processing)
+            self.execute_button.setToolTip("Cancel the current processing job.")
+            self.execute_button.setStyleSheet("QPushButton { background-color: #ff6b6b; color: white; }")
+            
             self.statusBar().showMessage("Processing... Please wait.")
         else:
+            # Change cancel button back to execute button
+            self.execute_button.setText("Execute")
+            self.execute_button.clicked.disconnect()
+            self.execute_button.clicked.connect(self.execute)
+            self.execute_button.setToolTip("Run the selected actions (text extraction, post-processing, audio generation).")
+            self.execute_button.setStyleSheet("")  # Reset to default style
+            
             self.statusBar().showMessage("Ready")
+
+    def cancel_processing(self):
+        """Cancel the current processing job and kill all child processes"""
+        if self.processing_thread and self.processing_thread.isRunning():
+            self.processing_thread.cancel()
+            self.statusBar().showMessage("Cancelling and killing processes...")
 
     def execute(self):
         if not hasattr(self, 'selected_folder'):
@@ -243,8 +321,10 @@ class MainWindow(QMainWindow):
         # Disable UI elements
         self.set_processing_state(True)
         
-        # Create processing function
+        # Create processing function with cancellation support
         def process_job():
+            global _cancellation_flag
+            
             ocr_strategy_class = self.ocr_strategy_combobox.currentData()
             tts_strategy_class = self.tts_strategy_combobox.currentData()
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -260,19 +340,33 @@ class MainWindow(QMainWindow):
             book = Book(self.selected_folder, ocr_strategy, tts_strategy)
             selected_chapter = self.chapter_combobox.currentText()
 
+            # Check for cancellation before each major step
+            if _cancellation_flag.is_set():
+                return
+
             if self.extract_text_radio.isChecked():
                 if selected_chapter == "All Chapters":
                     book.extract_all_texts(overwrite=True)
+                    if _cancellation_flag.is_set():
+                        return
                     book.save_all_texts()
                 else:
                     book.extract_text(selected_chapter, overwrite=True)
+                    if _cancellation_flag.is_set():
+                        return
                     book.save_chapter_text(selected_chapter)
+
+            if _cancellation_flag.is_set():
+                return
 
             if self.rerun_post_process_radio.isChecked():
                 if selected_chapter == "All Chapters":
                     book.rerun_post_processing()
                 else:
                     book.rerun_post_processing(selected_chapter)
+
+            if _cancellation_flag.is_set():
+                return
 
             if self.generate_audio_checkbox.isChecked():
                 if selected_chapter == "All Chapters":
@@ -284,6 +378,7 @@ class MainWindow(QMainWindow):
         self.processing_thread = ProcessingThread(process_job)
         self.processing_thread.finished.connect(self.on_processing_finished)
         self.processing_thread.error.connect(self.on_processing_error)
+        self.processing_thread.cancelled.connect(self.on_processing_cancelled)
         self.processing_thread.start()
 
     def on_processing_finished(self):
@@ -291,6 +386,11 @@ class MainWindow(QMainWindow):
         self.load_files()
         self.set_processing_state(False)
         self.statusBar().showMessage("Processing complete.")
+
+    def on_processing_cancelled(self):
+        """Called when processing is cancelled"""
+        self.set_processing_state(False)
+        self.statusBar().showMessage("Processing cancelled.")
 
     def on_processing_error(self, error_message):
         """Called when processing encounters an error"""
@@ -306,8 +406,10 @@ class MainWindow(QMainWindow):
         # Disable UI elements
         self.set_processing_state(True)
         
-        # Create export function
+        # Create export function with cancellation support
         def export_job():
+            global _cancellation_flag
+            
             ocr_strategy_class = self.ocr_strategy_combobox.currentData()
             tts_strategy_class = self.tts_strategy_combobox.currentData()
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -320,6 +422,10 @@ class MainWindow(QMainWindow):
 
             selected_chapter = self.chapter_combobox.currentText()
 
+            # Check for cancellation before processing
+            if _cancellation_flag.is_set():
+                return
+
             if selected_chapter == "All Chapters":
                 book.export_all_chapters(repo)
             else:
@@ -329,6 +435,7 @@ class MainWindow(QMainWindow):
         self.processing_thread = ProcessingThread(export_job)
         self.processing_thread.finished.connect(self.on_export_finished)
         self.processing_thread.error.connect(self.on_processing_error)
+        self.processing_thread.cancelled.connect(self.on_processing_cancelled)
         self.processing_thread.start()
 
     def on_export_finished(self):

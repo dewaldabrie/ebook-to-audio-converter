@@ -27,3 +27,5 @@ pydub
 
 # splitting senteneces
 nltk
+
+psutil

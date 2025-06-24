@@ -29,6 +29,12 @@ import soundfile as sf
 # Kokoro
 import sys
 import subprocess
+import threading
+import signal
+import psutil
+
+# Add this global variable
+_cancellation_flag = threading.Event()
 
 def ensure_kokoro_installed():
     """
@@ -62,6 +68,18 @@ from typing import Dict
 logging.basicConfig(level=logging.DEBUG)
 from multiprocessing import Pool, cpu_count
 
+# Add this function to handle graceful shutdown
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully"""
+    global _cancellation_flag
+    _cancellation_flag.set()
+    # Exit the process
+    os._exit(0)
+
+# Set up signal handlers for graceful termination
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
 class PostProcessStrategy:
     def post_process_text(self, text, meta: Dict = None):
         raise NotImplementedError("Post-process strategy must implement the post_process_text method")
@@ -74,6 +92,11 @@ class XAITextPostProcessStrategy(PostProcessStrategy):
         """
         if not text:
             return text
+        
+        # Check for cancellation before making API call
+        if _cancellation_flag.is_set():
+            return text
+            
         logging.info("Post-processing text")
         url = "https://api.x.ai/v1/chat/completions"
         api_key = os.getenv("XAI_API_KEY")
@@ -119,16 +142,27 @@ class XAITextPostProcessStrategy(PostProcessStrategy):
                     "content": text
                 }
             ],
-            "model": "grok-beta",
+            "model": "grok-3-mini",
             "stream": False,
             "temperature": 0
         }
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            corrected = response.json().get('choices', [{}])[0].get('message', {}).get('content', text)
-            return corrected
-        else:
-            logging.error(f"Failed to post-process text: {response.status_code} {response.text}")
+        
+        # Check for cancellation before making the request
+        if _cancellation_flag.is_set():
+            return text
+            
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                corrected = response.json().get('choices', [{}])[0].get('message', {}).get('content', text)
+                return corrected
+            else:
+                logging.error(f"Failed to post-process text: {response.status_code} {response.text}")
+                return text
+        except requests.exceptions.RequestException as e:
+            if _cancellation_flag.is_set():
+                return text
+            logging.error(f"Request failed: {e}")
             return text
 
 class OCRStrategy:
@@ -465,15 +499,31 @@ class Chapter:
 
     def post_process_from_pages(self, meta=None):
         chunked_pages = [list(self.pages.keys())[i:i+5] for i in range(0, len(self.pages), 5)]
-        with Pool(cpu_count()) as pool:
-            try:
-                processed_content = list(pool.imap(self._post_process_chunk, [(pages, meta) for pages in chunked_pages]))
-            except Exception as e:
-                import pdb; pdb.set_trace()
-                logging.error(f"Failed to post-process pages: {e}")
-        self.save_to_text_file('\n'.join(processed_content))
+        
+        # Check for cancellation before starting pool
+        if _cancellation_flag.is_set():
+            return
+            
+        try:
+            with Pool(cpu_count()) as pool:
+                # Check for cancellation periodically
+                for i, result in enumerate(pool.imap_unordered(self._post_process_chunk, [(pages, meta) for pages in chunked_pages])):
+                    if _cancellation_flag.is_set():
+                        pool.terminate()
+                        pool.join()
+                        return
+                    # Process result as needed
+                    
+        except Exception as e:
+            if _cancellation_flag.is_set():
+                return
+            logging.error(f"Failed to post-process pages: {e}")
 
     def _post_process_chunk(self, params):
+        # Check for cancellation at the start of each worker process
+        if _cancellation_flag.is_set():
+            return ""
+            
         pages, meta = params
         pre_processed_text = '\n'.join(pages)
         return self.ocr_strategy.post_process_text(pre_processed_text, meta=meta)
