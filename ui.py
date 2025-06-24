@@ -3,7 +3,7 @@ import os
 import threading
 import signal
 import psutil
-from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup
+from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup, QTabWidget, QAbstractItemView
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtCore import QUrl, Qt, QThread, Signal
 from jpeg_to_audio import Book, EasyOCROCR, TesseractOCR, GTTSStrategy, ParlerTTSStrategy, KokoroTTSStrategy, XAITextPostProcessStrategy, FileSystemRepo
@@ -165,14 +165,16 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.post_process_strategy_combobox)
         self.post_process_strategy_combobox.setToolTip("Post-processing strategy selection.")
 
-        self.chapter_label = QLabel("Select Chapter:")
+        self.chapter_label = QLabel("Select Chapter(s):")
         left_layout.addWidget(self.chapter_label)
-        self.chapter_label.setToolTip("Select a chapter to process or export.")
+        self.chapter_label.setToolTip("Select one or more chapters to process or export.")
 
-        self.chapter_combobox = QComboBox()
-        self.chapter_combobox.addItem("All Chapters")
-        left_layout.addWidget(self.chapter_combobox)
-        self.chapter_combobox.setToolTip("Chapter selection.")
+        # --- Change from QComboBox to QListWidget for multi-select ---
+        self.chapter_listwidget = QListWidget()
+        self.chapter_listwidget.setSelectionMode(QAbstractItemView.MultiSelection)
+        left_layout.addWidget(self.chapter_listwidget)
+        self.chapter_listwidget.setToolTip("Select one or more chapters. Hold Ctrl/Cmd or Shift to select multiple.")
+        # ------------------------------------------------------------
 
         # Create execute/cancel button
         self.execute_button = QPushButton("Execute")
@@ -193,9 +195,16 @@ class MainWindow(QMainWindow):
         self.file_list.itemClicked.connect(self.display_file_content)
         right_layout.addWidget(self.file_list)
 
+        # --- Tabbed region for file content and logs ---
+        self.tabs = QTabWidget()
         self.file_content = QTextEdit()
         self.file_content.setReadOnly(True)
-        right_layout.addWidget(self.file_content)
+        self.logs_content = QTextEdit()
+        self.logs_content.setReadOnly(True)
+        self.tabs.addTab(self.file_content, "File Content")
+        self.tabs.addTab(self.logs_content, "Logs")
+        right_layout.addWidget(self.tabs)
+        # ------------------------------------------------
 
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -259,14 +268,25 @@ class MainWindow(QMainWindow):
             self.file_list.addItem(item)
 
     def load_chapters(self):
-        self.chapter_combobox.clear()
-        self.chapter_combobox.addItem("All Chapters")
+        self.chapter_listwidget.clear()
+        # Add "All Chapters" as a special item
+        all_item = QListWidgetItem("All Chapters")
+        self.chapter_listwidget.addItem(all_item)
         folders = []
         for root, dirs, _ in os.walk(self.selected_folder):
             for dir in dirs:
                 folders.append(dir)
         for dir in sorted(folders):
-            self.chapter_combobox.addItem(dir)
+            self.chapter_listwidget.addItem(QListWidgetItem(dir))
+        # Select "All Chapters" by default
+        self.chapter_listwidget.setCurrentRow(0)
+
+    def get_selected_chapters(self):
+        selected_items = self.chapter_listwidget.selectedItems()
+        chapters = [item.text() for item in selected_items]
+        if "All Chapters" in chapters or not chapters:
+            return ["All Chapters"]
+        return chapters
 
     def display_file_content(self, item):
         file_path = item.data(Qt.UserRole)
@@ -276,11 +296,13 @@ class MainWindow(QMainWindow):
             self.file_content.setVisible(True)
             self.play_button.setVisible(False)
             self.stop_button.setVisible(False)
+            self.tabs.setCurrentWidget(self.file_content)  # Switch to file content tab
         elif file_path.endswith(('.mp3', '.wav')):
             self.media_player.setSource(QUrl.fromLocalFile(file_path))
             self.file_content.setVisible(False)
             self.play_button.setVisible(True)
             self.stop_button.setVisible(True)
+            self.tabs.setCurrentWidget(self.file_content)  # Still switch to file content tab
 
     def set_processing_state(self, processing=True):
         """Enable/disable UI elements during processing"""
@@ -296,6 +318,9 @@ class MainWindow(QMainWindow):
             self.execute_button.setStyleSheet("QPushButton { background-color: #ff6b6b; color: white; }")
             
             self.statusBar().showMessage("Processing... Please wait.")
+            self.logs_content.clear()
+            self.logs_content.append("=== Processing Started ===\n")
+            self.tabs.setCurrentWidget(self.logs_content)  # Switch to logs tab
         else:
             # Change cancel button back to execute button
             self.execute_button.setText("Execute")
@@ -318,13 +343,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Please select a folder first.")
             return
         
-        # Disable UI elements
         self.set_processing_state(True)
-        
-        # Create processing function with cancellation support
+
         def process_job():
             global _cancellation_flag
-            
+
             ocr_strategy_class = self.ocr_strategy_combobox.currentData()
             tts_strategy_class = self.tts_strategy_combobox.currentData()
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -332,49 +355,55 @@ class MainWindow(QMainWindow):
             ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
             tts_strategy = tts_strategy_class()
 
-            # If KokoroTTS is selected, set the voice
             if isinstance(tts_strategy, KokoroTTSStrategy) and not self.voice_combobox.isHidden():
                 selected_voice = self.voice_combobox.currentText()
                 tts_strategy.voice_name = selected_voice
 
             book = Book(self.selected_folder, ocr_strategy, tts_strategy)
-            selected_chapter = self.chapter_combobox.currentText()
+            selected_chapters = self.get_selected_chapters()
 
-            # Check for cancellation before each major step
-            if _cancellation_flag.is_set():
-                return
+            def log(msg):
+                QThread.msleep(10)
+                self.append_log(msg)
 
-            if self.extract_text_radio.isChecked():
-                if selected_chapter == "All Chapters":
-                    book.extract_all_texts(overwrite=True)
+            def refresh_files():
+                QThread.msleep(10)
+                self.load_files()
+
+            if "All Chapters" in selected_chapters:
+                chapters = list(book.chapters.keys())
+            else:
+                chapters = selected_chapters
+
+            for chapter in chapters:
+                if self.extract_text_radio.isChecked():
+                    log(f"Started text extraction for chapter: {chapter}")
+                    book.extract_text(chapter, overwrite=True)
                     if _cancellation_flag.is_set():
+                        log(f"Cancelled during text extraction for chapter: {chapter}")
                         return
-                    book.save_all_texts()
-                else:
-                    book.extract_text(selected_chapter, overwrite=True)
+                    book.save_chapter_text(chapter)
+                    log(f"Finished text extraction for chapter: {chapter}")
+                    refresh_files()
+
+                if self.rerun_post_process_radio.isChecked():
+                    log(f"Started post-processing for chapter: {chapter}")
+                    book.rerun_post_processing(chapter)
                     if _cancellation_flag.is_set():
+                        log(f"Cancelled during post-processing for chapter: {chapter}")
                         return
-                    book.save_chapter_text(selected_chapter)
+                    log(f"Finished post-processing for chapter: {chapter}")
+                    refresh_files()
 
-            if _cancellation_flag.is_set():
-                return
+                if self.generate_audio_checkbox.isChecked():
+                    log(f"Started audio generation for chapter: {chapter}")
+                    book.convert_text_to_audio(chapter, overwrite=True)
+                    if _cancellation_flag.is_set():
+                        log(f"Cancelled during audio generation for chapter: {chapter}")
+                        return
+                    log(f"Finished audio generation for chapter: {chapter}")
+                    refresh_files()
 
-            if self.rerun_post_process_radio.isChecked():
-                if selected_chapter == "All Chapters":
-                    book.rerun_post_processing()
-                else:
-                    book.rerun_post_processing(selected_chapter)
-
-            if _cancellation_flag.is_set():
-                return
-
-            if self.generate_audio_checkbox.isChecked():
-                if selected_chapter == "All Chapters":
-                    book.convert_all_texts_to_audio(overwrite=True)
-                else:
-                    book.convert_text_to_audio(selected_chapter, overwrite=True)
-
-        # Start processing in background thread
         self.processing_thread = ProcessingThread(process_job)
         self.processing_thread.finished.connect(self.on_processing_finished)
         self.processing_thread.error.connect(self.on_processing_error)
@@ -403,13 +432,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Please select a folder first.")
             return
         
-        # Disable UI elements
         self.set_processing_state(True)
-        
-        # Create export function with cancellation support
+
         def export_job():
             global _cancellation_flag
-            
+
             ocr_strategy_class = self.ocr_strategy_combobox.currentData()
             tts_strategy_class = self.tts_strategy_combobox.currentData()
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
@@ -420,18 +447,30 @@ class MainWindow(QMainWindow):
             book = Book(self.selected_folder, ocr_strategy, tts_strategy)
             repo = FileSystemRepo(os.path.join(os.path.dirname(os.path.dirname(self.selected_folder)), 'book_chapters'))
 
-            selected_chapter = self.chapter_combobox.currentText()
+            selected_chapters = self.get_selected_chapters()
 
-            # Check for cancellation before processing
-            if _cancellation_flag.is_set():
-                return
+            def log(msg):
+                QThread.msleep(10)
+                self.append_log(msg)
 
-            if selected_chapter == "All Chapters":
-                book.export_all_chapters(repo)
+            def refresh_files():
+                QThread.msleep(10)
+                self.load_files()
+
+            if "All Chapters" in selected_chapters:
+                chapters = list(book.chapters.keys())
             else:
-                book.export_chapter(selected_chapter, repo)
+                chapters = selected_chapters
 
-        # Start export in background thread
+            for chapter in chapters:
+                log(f"Started export for chapter: {chapter}")
+                book.export_chapter(chapter, repo)
+                if _cancellation_flag.is_set():
+                    log(f"Cancelled during export for chapter: {chapter}")
+                    return
+                log(f"Finished export for chapter: {chapter}")
+                refresh_files()
+
         self.processing_thread = ProcessingThread(export_job)
         self.processing_thread.finished.connect(self.on_export_finished)
         self.processing_thread.error.connect(self.on_processing_error)
@@ -443,6 +482,11 @@ class MainWindow(QMainWindow):
         self.load_files()
         self.set_processing_state(False)
         self.statusBar().showMessage("Export complete.")
+
+    def append_log(self, message):
+        self.logs_content.append(message)
+        scrollbar = self.logs_content.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
