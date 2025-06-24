@@ -150,7 +150,7 @@ class MainWindow(QMainWindow):
         self.voice_combobox = QComboBox()
         self.voice_combobox.setHidden(False)  # Initially hidden
         left_layout.addWidget(self.voice_combobox)
-        self.update_voice_selection(0)
+        self.update_voice_selection(0)  # Default to british George
         # Connect the signal for index change
         self.tts_strategy_combobox.currentIndexChanged.connect(self.update_voice_selection)
         self.voice_combobox.setToolTip("Select a voice for Kokoro TTS.")
@@ -233,6 +233,7 @@ class MainWindow(QMainWindow):
             for voice in KokoroTTSStrategy.voices:
                 self.voice_combobox.addItem(voice)
             self.voice_combobox.setHidden(False)
+            self.voice_combobox.setCurrentIndex(7)  # Default to british George
         else:
             # Hide the voice combobox for other strategies
             self.voice_combobox.setHidden(True)
@@ -259,7 +260,8 @@ class MainWindow(QMainWindow):
         found_files = []
         for root, _, files in os.walk(self.selected_folder):
             for file in files:
-                if file.endswith(('.txt', '.mp3', '.wav')):
+                # Exclude chunk txt files
+                if file.endswith(('.txt', '.mp3', '.wav')) and not ("_chunk_" in file and file.endswith('.txt')):
                     found_files.append(os.path.join(root, file))
         sorted_files = sorted(found_files)
         for file in sorted_files:
