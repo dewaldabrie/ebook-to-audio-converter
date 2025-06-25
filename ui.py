@@ -3,10 +3,14 @@ import os
 import threading
 import signal
 import psutil
-from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup, QTabWidget, QAbstractItemView
+from PySide6.QtWidgets import QListWidgetItem, QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QCheckBox, QComboBox, QLabel, QListWidget, QTextEdit, QRadioButton, QButtonGroup, QTabWidget, QAbstractItemView, QLineEdit
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtCore import QUrl, Qt, QThread, Signal
-from jpeg_to_audio import Book, EasyOCROCR, TesseractOCR, GTTSStrategy, ParlerTTSStrategy, KokoroTTSStrategy, XAITextPostProcessStrategy, FileSystemRepo
+from PySide6.QtGui import QIntValidator
+from jpeg_to_audio import Book, EasyOCROCR, TesseractOCR, GTTSStrategy, ParlerTTSStrategy, KokoroTTSStrategy, XAITextPostProcessStrategy, FileSystemRepo, NPagePerChapterSummaryStrategy, NPagePerBookSummaryStrategy
+import traceback
+import json
+import os.path
 
 # Global cancellation flag
 _cancellation_flag = threading.Event()
@@ -60,24 +64,20 @@ class ProcessingThread(QThread):
     
     def run(self):
         try:
-            # Reset cancellation flag
             global _cancellation_flag
             _cancellation_flag.clear()
-            
-            # Run the processing function
             self.processing_function(*self.args, **self.kwargs)
-            
             if not _cancellation_flag.is_set():
                 self.finished.emit()
             else:
                 self.cancelled.emit()
         except Exception as e:
+            tb = traceback.format_exc()
             if not _cancellation_flag.is_set():
-                self.error.emit(str(e))
+                self.error.emit(f"{e}\n{tb}")
             else:
                 self.cancelled.emit()
         finally:
-            # Always clean up child processes
             if self._cancelled:
                 self._kill_child_processes()
 
@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Ebook to Audio Converter")
+        
+        # Load last used folder
+        self.config_file = os.path.join(os.path.expanduser("~"), ".ebook_to_audio_config.json")
+        self.selected_folder = self.load_last_folder()
 
         # Status bar for messages
         self.statusBar().showMessage("Ready")
@@ -97,13 +101,16 @@ class MainWindow(QMainWindow):
 
         left_layout = QVBoxLayout()
 
-        self.folder_label = QLabel("Select folder with book pages:")
+        self.folder_label = QLabel("Select folder with scanned book:")
         left_layout.addWidget(self.folder_label)
 
         self.select_folder_button = QPushButton("Select Folder")
-        self.select_folder_button.setToolTip("Choose the root folder containing book pages (JPEG/JPG).")
+        self.select_folder_button.setToolTip("Choose the root folder containing subfolders for each chapter of the book. Each subfolder should have the scanned pages as images (JPEG/JPG).")
         self.select_folder_button.clicked.connect(self.select_folder)
         left_layout.addWidget(self.select_folder_button)
+
+        # Remove highlighting and set focus to "Select Folder" button
+        self.select_folder_button.setStyleSheet("")  # Remove any custom highlight
 
         # Radio buttons for text extraction options
         self.text_extraction_group = QButtonGroup(self)
@@ -120,11 +127,69 @@ class MainWindow(QMainWindow):
         self.extract_text_radio.setToolTip("Extract text from images using the selected OCR strategy.")
         self.rerun_post_process_radio.setToolTip("Rerun post-processing on existing text files.")
         self.skip_text_extraction.setToolTip("Skip text extraction step.")
+        
+        # --- Add summary checkbox ---
+        self.create_summary_checkbox = QCheckBox("Create Summary Version of Chapter(s)")
+        left_layout.addWidget(self.create_summary_checkbox)
+        self.create_summary_checkbox.setToolTip("Generate a summarized version of each chapter or book using the Grok API.")
 
         self.generate_audio_checkbox = QCheckBox("Generate Audio")
         left_layout.addWidget(self.generate_audio_checkbox)
         self.generate_audio_checkbox.setToolTip("Generate audio from extracted text using the selected TTS strategy.")
 
+        # --- Add style translation checkbox and dropdown ---
+        self.style_translation_checkbox = QCheckBox("Style Translation")
+        left_layout.addWidget(self.style_translation_checkbox)
+        self.style_translation_checkbox.setToolTip("Translate the style of summaries and post-processing.")
+
+        self.style_translation_combobox = QComboBox()
+        self.style_translation_combobox.addItems([
+            "Shakespearean",
+            "Hippy 90s",
+            "Flowerly, descriptive with vivid imagery",
+            "Standup Comedy",
+            "Everything Rhymes",
+            "Academic, cold and sanitised of any personality",
+            "Custom"
+        ])
+        self.style_translation_combobox.setVisible(False)
+        left_layout.addWidget(self.style_translation_combobox)
+
+        self.custom_style_input = QLineEdit()
+        self.custom_style_input.setPlaceholderText("Enter custom style/theme...")
+        self.custom_style_input.setVisible(False)
+        left_layout.addWidget(self.custom_style_input)
+
+        # --- Only apply style translation to summary option ---
+        self.only_style_summary_checkbox = QCheckBox("Only apply style translation to summary")
+        self.only_style_summary_checkbox.setVisible(False)
+        left_layout.addWidget(self.only_style_summary_checkbox)
+
+        def should_show_only_style_summary():
+            # Show if both summary and style translation are checked
+            if self.create_summary_checkbox.isChecked() and self.style_translation_checkbox.isChecked():
+                return True
+            # Or if style translation is checked and any *_summary.txt files exist
+            if self.style_translation_checkbox.isChecked():
+                if hasattr(self, 'selected_folder'):
+                    for root, _, files in os.walk(self.selected_folder):
+                        if any(f.endswith('_summary.txt') for f in files):
+                            return True
+            return False
+
+        def update_style_inputs():
+            show = self.style_translation_checkbox.isChecked()
+            self.style_translation_combobox.setVisible(show)
+            self.custom_style_input.setVisible(show and self.style_translation_combobox.currentText() == "Custom")
+            # Dynamically show the "only style summary" checkbox
+            self.only_style_summary_checkbox.setVisible(should_show_only_style_summary())
+        self.style_translation_checkbox.stateChanged.connect(update_style_inputs)
+        self.style_translation_combobox.currentIndexChanged.connect(update_style_inputs)
+        self.create_summary_checkbox.stateChanged.connect(update_style_inputs)
+        self.select_folder_button.clicked.connect(update_style_inputs)
+        update_style_inputs()
+
+        # --- OCR Strategy ---
         self.ocr_strategy_label = QLabel("Select OCR Strategy:")
         left_layout.addWidget(self.ocr_strategy_label)
         self.ocr_strategy_label.setToolTip("Choose the OCR engine for text extraction.")
@@ -135,6 +200,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.ocr_strategy_combobox)
         self.ocr_strategy_combobox.setToolTip("OCR engine selection.")
 
+        # --- TTS Strategy ---
         self.tts_strategy_label = QLabel("Select TTS Strategy:")
         left_layout.addWidget(self.tts_strategy_label)
         self.tts_strategy_label.setToolTip("Choose the TTS engine for audio generation.")
@@ -146,16 +212,15 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.tts_strategy_combobox)
         self.tts_strategy_combobox.setToolTip("TTS engine selection.")
 
-         # Dynamic Voice Selection Combobox
+        # Dynamic Voice Selection Combobox
         self.voice_combobox = QComboBox()
         self.voice_combobox.setHidden(False)  # Initially hidden
         left_layout.addWidget(self.voice_combobox)
         self.update_voice_selection(0)  # Default to british George
-        # Connect the signal for index change
         self.tts_strategy_combobox.currentIndexChanged.connect(self.update_voice_selection)
         self.voice_combobox.setToolTip("Select a voice for Kokoro TTS.")
 
-
+        # --- Post-Process Strategy ---
         self.post_process_strategy_label = QLabel("Select Post-Process Strategy:")
         left_layout.addWidget(self.post_process_strategy_label)
         self.post_process_strategy_label.setToolTip("Choose the post-processing strategy for OCR text.")
@@ -164,6 +229,61 @@ class MainWindow(QMainWindow):
         self.post_process_strategy_combobox.addItem("XAITextPostProcess", XAITextPostProcessStrategy)
         left_layout.addWidget(self.post_process_strategy_combobox)
         self.post_process_strategy_combobox.setToolTip("Post-processing strategy selection.")
+
+        # --- Summary strategy selection ---
+        self.summary_label = QLabel("Select Summarisation Strategy:")
+        left_layout.addWidget(self.summary_label)
+        self.summary_label.setToolTip("Choose how to best summarise this work.")
+        self.summary_strategy_combobox = QComboBox()
+        self.summary_strategy_combobox.addItem("N pages per chapter", NPagePerChapterSummaryStrategy)
+        self.summary_strategy_combobox.addItem("N pages per book", NPagePerBookSummaryStrategy)
+        left_layout.addWidget(self.summary_strategy_combobox)
+        self.summary_strategy_combobox.setToolTip("Choose summary strategy.")
+
+        self.n_pages_chapter_input = QLineEdit("1")
+        self.n_pages_chapter_input.setValidator(QIntValidator(1, 20))
+        self.n_pages_chapter_input.setToolTip("Number of pages per chapter for summary.")
+        left_layout.addWidget(self.n_pages_chapter_input)
+
+        self.n_pages_book_input = QLineEdit("2")
+        self.n_pages_book_input.setValidator(QIntValidator(1, 20))
+        self.n_pages_book_input.setToolTip("Number of pages for book summary.")
+        left_layout.addWidget(self.n_pages_book_input)
+
+        # --- UI visibility logic ---
+        def update_dynamic_visibility():
+            # 1. OCR strategy
+            show_ocr = self.extract_text_radio.isChecked()
+            self.ocr_strategy_label.setVisible(show_ocr)
+            self.ocr_strategy_combobox.setVisible(show_ocr)
+
+            # 2. TTS strategy
+            show_tts = self.generate_audio_checkbox.isChecked()
+            self.tts_strategy_label.setVisible(show_tts)
+            self.tts_strategy_combobox.setVisible(show_tts)
+            self.voice_combobox.setVisible(show_tts and self.tts_strategy_combobox.currentData() == KokoroTTSStrategy)
+
+            # 3. Post-process strategy
+            show_post = self.extract_text_radio.isChecked() or self.rerun_post_process_radio.isChecked()
+            self.post_process_strategy_label.setVisible(show_post)
+            self.post_process_strategy_combobox.setVisible(show_post)
+
+            # 4. Summary strategy
+            show_summary = self.create_summary_checkbox.isChecked()
+            self.summary_label.setVisible(show_summary)
+            self.summary_strategy_combobox.setVisible(show_summary)
+            self.n_pages_chapter_input.setVisible(show_summary and self.summary_strategy_combobox.currentIndex() in [0, 1])
+            self.n_pages_book_input.setVisible(show_summary and self.summary_strategy_combobox.currentIndex() == 1)
+
+        # Connect all relevant signals
+        self.extract_text_radio.toggled.connect(update_dynamic_visibility)
+        self.rerun_post_process_radio.toggled.connect(update_dynamic_visibility)
+        self.skip_text_extraction.toggled.connect(update_dynamic_visibility)
+        self.generate_audio_checkbox.toggled.connect(update_dynamic_visibility)
+        self.tts_strategy_combobox.currentIndexChanged.connect(update_dynamic_visibility)
+        self.create_summary_checkbox.toggled.connect(update_dynamic_visibility)
+        self.summary_strategy_combobox.currentIndexChanged.connect(update_dynamic_visibility)
+        update_dynamic_visibility()
 
         self.chapter_label = QLabel("Select Chapter(s):")
         left_layout.addWidget(self.chapter_label)
@@ -224,6 +344,15 @@ class MainWindow(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
+        # Now that all UI elements are created, restore the last folder if available
+        if self.selected_folder and os.path.exists(self.selected_folder):
+            self.folder_label.setText(f"Selected folder:\n{self.truncate_text(self.selected_folder)}")
+            self.load_files()
+            self.load_chapters()
+            self.statusBar().showMessage("Last folder restored.")
+
+        self.select_folder_button.setFocus()
+
     def update_voice_selection(self, index):
         selected_strategy = self.tts_strategy_combobox.itemData(index)
         
@@ -244,13 +373,34 @@ class MainWindow(QMainWindow):
             text = '...' + text[max(0, len(text) - length):]
         return text
 
+    def load_last_folder(self):
+        """Load the last used folder from config file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    return config.get('last_folder', None)
+        except Exception as e:
+            print(f"Error loading config: {e}")
+        return None
+
+    def save_last_folder(self, folder_path):
+        """Save the selected folder to config file"""
+        try:
+            config = {'last_folder': folder_path}
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
-            self.folder_label.setText(f"Selected folder:\n{self.truncate_text(folder)}")
             self.selected_folder = folder
+            self.folder_label.setText(f"Selected folder:\n{self.truncate_text(folder)}")
             self.load_files()
             self.load_chapters()
+            self.save_last_folder(folder)  # Save the selected folder
             self.statusBar().showMessage("Folder loaded.")
         else:
             self.statusBar().showMessage("No folder selected.")
@@ -355,13 +505,42 @@ class MainWindow(QMainWindow):
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
 
             ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
-            tts_strategy = tts_strategy_class()
+
+            # Always ensure a valid TTS strategy is selected if audio generation is requested
+            if self.generate_audio_checkbox.isChecked() and tts_strategy_class is None:
+                # Fallback to the first available TTS strategy
+                self.tts_strategy_combobox.setCurrentIndex(0)
+                tts_strategy_class = self.tts_strategy_combobox.currentData()
+            tts_strategy = tts_strategy_class() if tts_strategy_class else None
 
             if isinstance(tts_strategy, KokoroTTSStrategy) and not self.voice_combobox.isHidden():
                 selected_voice = self.voice_combobox.currentText()
                 tts_strategy.voice_name = selected_voice
 
-            book = Book(self.selected_folder, ocr_strategy, tts_strategy)
+            summary_strategy_class = self.summary_strategy_combobox.currentData()
+            n_pages_chapter = int(self.n_pages_chapter_input.text())
+            n_pages_book = int(self.n_pages_book_input.text())
+
+            # Gather style translation info
+            style_translation = None
+            only_style_summary = False
+            if self.style_translation_checkbox.isChecked():
+                style_translation = self.style_translation_combobox.currentText()
+                if style_translation == "Custom":
+                    style_translation = self.custom_style_input.text().strip()
+                    if not style_translation:
+                        style_translation = None
+                only_style_summary = self.only_style_summary_checkbox.isChecked()
+
+            book = Book(
+                self.selected_folder, ocr_strategy, tts_strategy,
+                summary_strategy=summary_strategy_class(),
+                summary_n_pages=n_pages_chapter,
+                book_summary_n_pages=n_pages_book,
+                style_translation=style_translation,
+                only_style_summary=only_style_summary
+            )
+
             selected_chapters = self.get_selected_chapters()
 
             def log(msg):
@@ -397,7 +576,34 @@ class MainWindow(QMainWindow):
                     log(f"Finished post-processing for chapter: {chapter}")
                     refresh_files()
 
+                # --- Summary generation ---
+                if self.create_summary_checkbox.isChecked():
+                    log(f"Started summary generation for chapter: {chapter}")
+                    try:
+                        summary_path = book.summarize_chapter(chapter)
+                        log(f"Summary saved to {summary_path}")
+                        refresh_files()
+                    except Exception as e:
+                        log(f"Error during summary generation for chapter {chapter}: {e}")
+                        continue
+
                 if self.generate_audio_checkbox.isChecked():
+                    # Robustly find the chapter object
+                    chapter_obj = None
+                    for key in book.chapters:
+                        if key.strip().lower() == chapter.strip().lower():
+                            chapter_obj = book.chapters[key]
+                            break
+                    if not chapter_obj:
+                        log(f"Cannot generate audio for chapter: '{chapter}' (not found in book.chapters: {list(book.chapters.keys())})")
+                        continue
+
+                    text_path = os.path.join(chapter_obj.folder_path, f"{chapter_obj.title}.txt")
+                    log(f"Checking for text file: {text_path}")
+                    if not os.path.exists(text_path):
+                        log(f"Cannot generate audio for chapter: {chapter} because text file does not exist at {text_path}. Run text extraction first.")
+                        continue
+
                     log(f"Started audio generation for chapter: {chapter}")
                     book.convert_text_to_audio(chapter, overwrite=True)
                     if _cancellation_flag.is_set():
@@ -405,6 +611,16 @@ class MainWindow(QMainWindow):
                         return
                     log(f"Finished audio generation for chapter: {chapter}")
                     refresh_files()
+                    # --- Generate audio for summary if present ---
+                    if self.create_summary_checkbox.isChecked():
+                        log(f"Started audio generation for summary of chapter: {chapter}")
+                        try:
+                            summary_audio_path = book.convert_summary_to_audio(chapter, overwrite=True)
+                            log(f"Summary audio saved to {summary_audio_path}")
+                            refresh_files()
+                        except Exception as e:
+                            log(f"Error during summary audio generation for chapter {chapter}: {e}")
+                            continue
 
         self.processing_thread = ProcessingThread(process_job)
         self.processing_thread.finished.connect(self.on_processing_finished)
@@ -426,7 +642,9 @@ class MainWindow(QMainWindow):
     def on_processing_error(self, error_message):
         """Called when processing encounters an error"""
         self.set_processing_state(False)
-        self.statusBar().showMessage(f"Error: {error_message}")
+        self.append_log(f"Error: {error_message}")
+        self.statusBar().showMessage(f"Error: {error_message}", 5000)
+        self.statusBar().repaint()
 
     def export(self):
         if not hasattr(self, 'selected_folder'):
@@ -444,10 +662,38 @@ class MainWindow(QMainWindow):
             post_process_strategy_class = self.post_process_strategy_combobox.currentData()
 
             ocr_strategy = ocr_strategy_class(post_process_strategy=post_process_strategy_class())
-            tts_strategy = tts_strategy_class()
 
-            book = Book(self.selected_folder, ocr_strategy, tts_strategy)
-            repo = FileSystemRepo(os.path.join(os.path.dirname(os.path.dirname(self.selected_folder)), 'book_chapters'))
+            # Always ensure a valid TTS strategy is selected if audio generation is requested
+            if self.generate_audio_checkbox.isChecked() and tts_strategy_class is None:
+                # Fallback to the first available TTS strategy
+                self.tts_strategy_combobox.setCurrentIndex(0)
+                tts_strategy_class = self.tts_strategy_combobox.currentData()
+            tts_strategy = tts_strategy_class() if tts_strategy_class else None
+
+            summary_strategy_class = self.summary_strategy_combobox.currentData()
+            n_pages_chapter = int(self.n_pages_chapter_input.text())
+            n_pages_book = int(self.n_pages_book_input.text())
+
+            # Gather style translation info
+            style_translation = None
+            only_style_summary = False
+            if self.style_translation_checkbox.isChecked():
+                style_translation = self.style_translation_combobox.currentText()
+                if style_translation == "Custom":
+                    style_translation = self.custom_style_input.text().strip()
+                    if not style_translation:
+                        style_translation = None
+                only_style_summary = self.only_style_summary_checkbox.isChecked()
+
+            book = Book(
+                self.selected_folder, ocr_strategy, tts_strategy,
+                summary_strategy=summary_strategy_class(),
+                summary_n_pages=n_pages_chapter,
+                book_summary_n_pages=n_pages_book,
+                style_translation=style_translation,
+                only_style_summary=only_style_summary
+            )
+            repo = FileSystemRepo(os.path.join(os.path.dirname(os.path.dirname(self.selected_folder)), 'audio_books'))
 
             selected_chapters = self.get_selected_chapters()
 
@@ -466,7 +712,7 @@ class MainWindow(QMainWindow):
 
             for chapter in chapters:
                 log(f"Started export for chapter: {chapter}")
-                book.export_chapter(chapter, repo)
+                book.export_chapter(chapter, repo, include_summary=True)
                 if _cancellation_flag.is_set():
                     log(f"Cancelled during export for chapter: {chapter}")
                     return

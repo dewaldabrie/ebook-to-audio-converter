@@ -104,6 +104,15 @@ class XAITextPostProcessStrategy(PostProcessStrategy):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}"
         }
+        style_translation = None
+        only_style_summary = False
+        if meta and 'only_style_summary' in meta:
+            only_style_summary = meta['only_style_summary']
+        if meta and 'style_translation' in meta and meta['style_translation']:
+            style_translation = meta['style_translation']
+        style_prompt = ""
+        if style_translation and not only_style_summary:
+            style_prompt = f"\n\nTranslate the style of the text to: {style_translation}."
         payload = {
             "messages": [
                 {
@@ -129,6 +138,7 @@ class XAITextPostProcessStrategy(PostProcessStrategy):
 
                     Avoid accentuating chapter headings with asterisk, since the TTS model vocalised the asterisk symbols.
                     Just put the headings on their own line with a double line break before and after.
+                    {style_prompt}
                     
                     Metadata for the text that folllows: 
                     {pformat(meta)}
@@ -226,6 +236,18 @@ class EasyOCROCR(OCRStrategy):
 import pydub
 import nltk
 
+# Move the conversion function outside the class to avoid pickling issues
+def convert_wav_to_mp3_process(wav_path, mp3_path, result_queue):
+    """Convert WAV to MP3 in a separate process"""
+    try:
+        import pydub
+        sound = pydub.AudioSegment.from_wav(wav_path)
+        sound.export(mp3_path, format="mp3")
+        del sound
+        result_queue.put(("success", mp3_path))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
 class TTSStrategy:
     def convert_text_to_audio(self, text, output_path):
         raise NotImplementedError("TTS strategy must implement the convert_text_to_audio method")
@@ -250,7 +272,40 @@ class TTSStrategy:
         return chunks
     
     @staticmethod
-    def combine_audio_chunks(audio_chunks: List[str], output_path):
+    def combine_audio_chunks(audio_chunks: list, output_path):
+        # Check if WAV file already exists
+        wav_path = output_path + '.wav'
+        if os.path.exists(wav_path):
+            logging.info(f"WAV file already exists at {wav_path}, skipping TTS generation")
+            # Proceed directly to MP3 conversion
+            mp3_output_path = wav_path.replace('.wav', '.mp3')
+            try:
+                # Use subprocess instead of multiprocessing to avoid memory issues
+                import subprocess
+                result = subprocess.run([
+                    'ffmpeg', '-y', '-i', wav_path, '-acodec', 'libmp3lame', 
+                    '-ab', '128k', mp3_output_path
+                ], capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0:
+                    logging.debug(f"Successfully converted to MP3: {mp3_output_path}")
+                    # Clean up WAV file
+                    try:
+                        os.remove(wav_path)
+                    except Exception as e:
+                        logging.warning(f"Could not delete WAV file {wav_path}: {e}")
+                    return mp3_output_path
+                else:
+                    logging.warning(f"MP3 conversion failed: {result.stderr}, keeping WAV file")
+                    return wav_path
+                    
+            except subprocess.TimeoutExpired:
+                logging.warning("MP3 conversion timed out, keeping WAV file")
+                return wav_path
+            except Exception as e:
+                logging.warning(f"MP3 conversion process failed: {e}, keeping WAV file")
+                return wav_path
+
         # Read all files to gather data
         all_audio_data = []
         total_frames = 0
@@ -281,22 +336,43 @@ class TTSStrategy:
                 output.writeframes(data.tobytes())
         logging.debug(f"Concatenated audio written to {output_path}")
 
-        # Convert the concatenated .wav file to .mp3
-        sound = pydub.AudioSegment.from_wav(output_path)
+        # Convert WAV to MP3 using subprocess instead of multiprocessing
         mp3_output_path = output_path.replace('.wav', '.mp3')
-        sound.export(mp3_output_path, format="mp3")
-        # Explicitly delete the AudioSegment object and wait before removing the file
-        del sound
-        time.sleep(0.2)  # Give the OS time to release the file handle
         try:
-            os.remove(output_path)
+            import subprocess
+            result = subprocess.run([
+                'ffmpeg', '-y', '-i', output_path, '-acodec', 'libmp3lame', 
+                '-ab', '128k', mp3_output_path
+            ], capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0:
+                logging.debug(f"Successfully converted to MP3: {mp3_output_path}")
+                # Clean up WAV file
+                try:
+                    os.remove(output_path)
+                except Exception as e:
+                    logging.warning(f"Could not delete WAV file {output_path}: {e}")
+                return mp3_output_path
+            else:
+                logging.warning(f"MP3 conversion failed: {result.stderr}, keeping WAV file")
+                return output_path
+                
+        except subprocess.TimeoutExpired:
+            logging.warning("MP3 conversion timed out, keeping WAV file")
+            return output_path
         except Exception as e:
-            logging.warning(f"Could not delete wav file {output_path}: {e}")
-        return mp3_output_path
-        
+            logging.warning(f"MP3 conversion process failed: {e}, keeping WAV file")
+            return output_path
 
 class GTTSStrategy(TTSStrategy):
     def convert_text_to_audio(self, text, output_path):
+        # Check if WAV file already exists
+        wav_path = output_path + '.wav'
+        if os.path.exists(wav_path):
+            logging.info(f"WAV file already exists at {wav_path}, skipping TTS generation")
+            # Proceed directly to MP3 conversion
+            return self.combine_audio_chunks([], output_path)
+        
         chunks = self.split_text_into_chunks(text)
         with Pool(cpu_count()) as pool:
             audio_chunks = list(pool.imap(self._process_chunk, [(chunk, output_path, i, len(chunks)) for i, chunk in enumerate(chunks)]))
@@ -330,6 +406,13 @@ class ParlerTTSStrategy(TTSStrategy):
         tts_input_ids = tts_tokenizer(description, return_tensors="pt").input_ids.to(device)
         
     def convert_text_to_audio(self, text, output_path):
+        # Check if WAV file already exists
+        wav_path = output_path + '.wav'
+        if os.path.exists(wav_path):
+            logging.info(f"WAV file already exists at {wav_path}, skipping TTS generation")
+            # Proceed directly to MP3 conversion
+            return self.combine_audio_chunks([], output_path)
+        
         import torch
         from multiprocessing import get_context, cpu_count
         chunks = self.split_text_into_chunks(text)
@@ -393,6 +476,13 @@ class KokoroTTSStrategy(TTSStrategy):
         logging.info(f"Loaded Kokoro voice: {voice_name}")
 
     def convert_text_to_audio(self, text, output_path):
+        # Check if WAV file already exists
+        wav_path = output_path + '.wav'
+        if os.path.exists(wav_path):
+            logging.info(f"WAV file already exists at {wav_path}, skipping TTS generation")
+            # Proceed directly to MP3 conversion
+            return self.combine_audio_chunks([], output_path)
+        
         from multiprocessing import get_context, cpu_count
         chunks = self.split_text_into_chunks(text)
         batch_params = [(chunk, output_path, i, len(chunks)) for i, chunk in enumerate(chunks) if chunk]
@@ -440,6 +530,7 @@ class KokoroTTSStrategy(TTSStrategy):
 
 from abc import ABC, abstractmethod
 import nltk
+from concurrent.futures import ThreadPoolExecutor
 
 class Repository(ABC):
     @abstractmethod
@@ -467,8 +558,39 @@ class FileSystemRepo(Repository):
         audio_dest_path = os.path.join(audio_folder, f"{chapter_title}.mp3")
         shutil.copyfile(audio_path, audio_dest_path)
 
+class SummaryStrategy:
+    def summarize_chapter(self, chapter_text, meta, n_pages=1):
+        raise NotImplementedError
+
+    def summarize_book(self, chapter_summaries, meta, n_pages=2):
+        raise NotImplementedError
+
+class NPagePerChapterSummaryStrategy(SummaryStrategy):
+    def summarize_chapter(self, chapter_text, meta, n_pages=1):
+        return Book._summarize_text_with_grok_static(
+            chapter_text, meta, n_pages=n_pages
+        )
+
+    def summarize_book(self, chapter_summaries, meta, n_pages=2):
+        # Not used for this strategy
+        return None
+
+class NPagePerBookSummaryStrategy(SummaryStrategy):
+    def summarize_chapter(self, chapter_text, meta, n_pages=1):
+        # Always do 1-page-per-chapter first
+        return Book._summarize_text_with_grok_static(
+            chapter_text, meta, n_pages=1
+        )
+
+    def summarize_book(self, chapter_summaries, meta, n_pages=2):
+        # Combine all chapter summaries and summarize to n pages
+        combined = "\n\n".join(chapter_summaries)
+        return Book._summarize_text_with_grok_static(
+            combined, meta, n_pages=n_pages, is_book=True
+        )
+
 class Chapter:
-    def __init__(self, folder_path, ocr_strategy: OCRStrategy, tts_strategy: TTSStrategy):
+    def __init__(self, folder_path, ocr_strategy=None, tts_strategy=None):
         self.folder_path = folder_path
         self.title = os.path.basename(folder_path)
         self.pages = self.load_pages()
@@ -605,21 +727,26 @@ class Chapter:
             repo.save_audio(book_title, self.title, audio_path)
 
 class Book:
-    def __init__(self, root_folder, ocr_strategy: OCRStrategy, tts_strategy: TTSStrategy):
+    def __init__(self, root_folder, ocr_strategy=None, tts_strategy=None, summary_strategy=None, summary_n_pages=1, book_summary_n_pages=2, style_translation=None, only_style_summary=False):
         self.root_folder = root_folder
         self.tts_strategy = tts_strategy
         self.chapters = self.load_chapters(ocr_strategy)
+        self.summary_strategy = summary_strategy or NPagePerBookSummaryStrategy()
+        self.summary_n_pages = summary_n_pages
+        self.book_summary_n_pages = book_summary_n_pages
+        self.style_translation = style_translation
+        self.only_style_summary = only_style_summary
     
     @property
     def title(self):
         return os.path.basename(self.root_folder).replace('_', ' ')
 
-    def load_chapters(self, ocr_strategy):
+    def load_chapters(self, ocr_strategy=None):
         chapters = {}
         for folder_name in sorted(os.listdir(self.root_folder)):
             folder_path = os.path.join(self.root_folder, folder_name)
             if os.path.isdir(folder_path):
-                chapter =  Chapter(folder_path, ocr_strategy, self.tts_strategy)
+                chapter = Chapter(folder_path, ocr_strategy, self.tts_strategy)
                 chapters[chapter.title] = chapter
         return chapters
 
@@ -665,14 +792,147 @@ class Book:
             logging.info(f"Exporting chapter: {chapter.title}")
             chapter.export(repo, book_title=self.title)
 
-    def export_chapter(self, chapter_title, repo: Repository):
+    def export_chapter(self, chapter_title, repo: Repository, include_summary=False):
         if chapter_title in self.chapters:
             chapter = self.chapters[chapter_title]
             logging.info(f"Exporting chapter: {chapter.title}")
             chapter.export(repo, book_title=self.title)
+            if include_summary:
+                # Export summary text and audio if present
+                summary_path = os.path.join(chapter.folder_path, f"{chapter.title}_summary.txt")
+                summary_audio_path = os.path.join(chapter.folder_path, f"{chapter.title}_summary.mp3")
+                if os.path.exists(summary_path):
+                    repo.save_text(self.title, f"{chapter.title}_summary", open(summary_path).read())
+                if os.path.exists(summary_audio_path):
+                    repo.save_audio(self.title, f"{chapter.title}_summary", summary_audio_path)
+
+    def summarize_chapter(self, chapter_title):
+        if chapter_title not in self.chapters:
+            raise ValueError(f"Chapter {chapter_title} not found.")
+        chapter = self.chapters[chapter_title]
+        text = chapter.text_from_file
+        if not text:
+            raise ValueError(f"No text found for chapter {chapter_title} to summarize.")
+        # Only apply style translation to summary if requested
+        meta = {'book_title': self.title, 'chapter_title': chapter_title}
+        if self.style_translation and self.only_style_summary:
+            meta['style_translation'] = self.style_translation
+        elif self.style_translation and not self.only_style_summary:
+            meta['style_translation'] = self.style_translation
+        summary = self.summary_strategy.summarize_chapter(
+            text, meta=meta, n_pages=self.summary_n_pages
+        )
+        summary_path = os.path.join(chapter.folder_path, f"{chapter.title}_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write(summary)
+        return summary_path
+
+    def summarize_book(self):
+        # Summarize each chapter first
+        chapter_summaries = []
+        for chapter_title in self.chapters:
+            summary_path = os.path.join(self.chapters[chapter_title].folder_path, f"{chapter_title}_summary.txt")
+            if not os.path.exists(summary_path):
+                self.summarize_chapter(chapter_title)
+            with open(summary_path, 'r') as f:
+                chapter_summaries.append(f.read())
+        # Now summarize the book
+        book_summary = self.summary_strategy.summarize_book(
+            chapter_summaries, meta={'book_title': self.title}, n_pages=self.book_summary_n_pages
+        )
+        book_summary_path = os.path.join(self.root_folder, f"{self.title}_book_summary.txt")
+        with open(book_summary_path, 'w') as f:
+            f.write(book_summary)
+        return book_summary_path
+
+    def convert_summary_to_audio(self, chapter_title, overwrite=False):
+        """
+        Convert the summary text to audio using the selected TTS strategy.
+        """
+        if chapter_title not in self.chapters:
+            raise ValueError(f"Chapter {chapter_title} not found.")
+        chapter = self.chapters[chapter_title]
+        summary_path = os.path.join(chapter.folder_path, f"{chapter.title}_summary.txt")
+        audio_output_path = os.path.join(chapter.folder_path, f"{chapter.title}_summary")
+        # Only generate summary audio if the .mp3 file does not already exist (or overwrite is True)
+        if not overwrite and os.path.exists(audio_output_path + '.mp3'):
+            logging.info(f"Summary audio for chapter {chapter.title} already exists at {audio_output_path}.mp3. Skipping audio conversion.")
+            return audio_output_path + '.mp3'
+        if not os.path.exists(summary_path):
+            raise ValueError(f"No summary found for chapter {chapter_title}.")
+        with open(summary_path, 'r') as f:
+            text = f.read()
+        self.tts_strategy.convert_text_to_audio(text, audio_output_path)
+        return audio_output_path + '.mp3'
+
+    def summarize_all_chapters(self):
+        # Use threads, not processes, for API calls
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for chapter_title in self.chapters:
+                futures.append(executor.submit(self.summarize_chapter, chapter_title))
+            for future in futures:
+                future.result()  # Will raise if any thread failed
+
+    @staticmethod
+    def _summarize_text_with_grok_static(text, meta=None, n_pages=1, is_book=False):
+        import requests, os, logging
+        url = "https://api.x.ai/v1/chat/completions"
+        api_key = os.getenv("XAI_API_KEY")
+        if not api_key:
+            logging.error("XAI_API_KEY not set in environment variables.")
+            return ""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        style_translation = None
+        if meta and 'style_translation' in meta and meta['style_translation']:
+            style_translation = meta['style_translation']
+        style_prompt = ""
+        if style_translation:
+            style_prompt = f"\n\nTranslate the style of the summary to: {style_translation}."
+        if is_book:
+            prompt = (
+                f"Summarize the following book into {n_pages} pages, preserving the main ideas and key points, "
+                "and write it in a way suitable for narration. Avoid listing points; instead, create a smooth, readable summary. "
+                "Do not include any introductory or closing remarks about summarization. Just output the summary text."
+                f"{style_prompt}\n\n"
+                f"Metadata: {pformat(meta)}\n\n{text}"
+            )
+        else:
+            prompt = (
+                f"Summarize the following chapter into {n_pages} page(s), preserving the main ideas and key points, "
+                "and write it in a way suitable for narration. Avoid listing points; instead, create a smooth, readable summary. "
+                "Do not include any introductory or closing remarks about summarization. Just output the summary text."
+                f"{style_prompt}\n\n"
+                f"Metadata: {pformat(meta)}\n\n{text}"
+            )
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are a book summarization assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            "model": "grok-3-mini",
+            "stream": False,
+            "temperature": 0
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                return response.json().get('choices', [{}])[0].get('message', {}).get('content', "")
+            else:
+                logging.error(f"Failed to summarize text: {response.status_code} {response.text}")
+                return ""
+        except requests.exceptions.Timeout:
+            logging.error("xAI API request timed out during summarization.")
+            return ""
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed during summarization: {e}")
+            return ""
 
 if __name__ == '__main__':
-    ROOT_FOLDER = os.path.join(os.path.dirname(__file__), 'book_pages', 'sandford__healing_for_a_womans_emotions')
+    ROOT_FOLDER = os.path.join(os.path.dirname(__file__), 'scanned_books', 'sandford__healing_for_a_womans_emotions')
     ocr_strategy = EasyOCROCR(post_process_strategy=XAITextPostProcessStrategy())  # Change to EasyOCROCR() to use easyocr
     tts_strategy = KokoroTTSStrategy()  # Change to KokoroTTSStrategy() to use Kokoro
     # tts_strategy = None
